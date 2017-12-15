@@ -105,6 +105,7 @@
  */
 
 #include "mbed.h"
+#include "stm32f4xx_hal_pwr.h" // To enable the WKUP pin
 #include "accelerometer_adxl345.h"
 #include "gnss.h"
 #include "low_power.h"
@@ -151,10 +152,10 @@
 #define PASSWORD    NULL
 
 // The address of the server we are sending to.
-#define SERVER_ADDRESS "blah"
+#define SERVER_ADDRESS "ciot.it-sgn.u-blox.com"
 
 // The port of the server we are sending to.
-#define SERVER_PORT 1234
+#define SERVER_PORT 5065
 
 /****************************************************************
  * CONFIGURATION MACROS
@@ -194,6 +195,10 @@
 /// If the system cannot establish time by talking to the 
 // Particle server, wait this long and try again.
 #define TIME_SYNC_RETRY_PERIOD_SECONDS 30
+
+/// The number of times to retry before giving up if an attempt
+// to connect fails.
+#define CONNECT_RETRIES 10
 
 /// The time between wake-ups as a result of motion being detected.
 #define MIN_MOTION_PERIOD_SECONDS 30
@@ -275,8 +280,11 @@
 /// The maximum time to wait for a GNSS fix
 #define GNSS_MAX_ON_TIME_SECONDS (60 * 10)
 
+/// How long to wait for an Ack message back from the GNSS module.
+#define GNSS_WAIT_FOR_ACK_MILLISECONDS 3000
+
 /// How long to wait for responses from the GNSS module.
-#define GNSS_WAIT_FOR_RESPONSE_MILLISECONDS 2000
+#define GNSS_WAIT_FOR_RESPONSE_MILLISECONDS 5000
 
 /// The minimum number of satellites for which we want to have ephemeris data.
 #define GNSS_MIN_NUM_EPHEMERIS_DATA 5
@@ -510,48 +518,56 @@ typedef struct {
 /// Record type strings.
 // NOTE: must match the RecordType_t enum above and must be no less
 // than LEN_RECORD_TYPE characters long.
-const char *recordTypeString[] = {"null:", "telemetry:", "gnss:", "stats:"};
+static const char *recordTypeString[] = {"null:", "telemetry:", "gnss:", "stats:"};
 
 /// Whether we have an accelerometer or not
-bool accelerometerConnected = false;
+static bool accelerometerConnected = false;
+
+/// The interrupt input pin from the accelerometer, has to be
+// this pin as this is the only pin that can wake the processor
+// from Standby mode.
+static InterruptIn accelerometerInterrupt(PA_0);
 
 /// The stats period, stored in RAM so that it can
 // be overridden.
-time_t statsPeriodSeconds = STATS_PERIOD_SECONDS;
+static time_t statsPeriodSeconds = STATS_PERIOD_SECONDS;
 
 /// Track, for info, the number of satellites that
 // could be used for navigation, if there were any.
-uint32_t gnssNumSatellitesUsable = 0;
+static uint32_t gnssNumSatellitesUsable = 0;
 
 /// Track, for info, the peak C/N of the satellites
 // used for navigation the last time there were any.
-uint32_t gnssPeakCNUsed = 0;
+static uint32_t gnssPeakCNUsed = 0;
 
 /// Track, for info, the average C/N of the satellites
 // used for navigation the last time there were any.
-uint32_t gnssAverageCNUsed = 0;
+static uint32_t gnssAverageCNUsed = 0;
 
 /// All the normal retained variables.
 BACKUP_SRAM
-Retained_t r;
+static Retained_t r;
 
 /// A set of retained variables which are reset separately
 // from the normal set.
 BACKUP_SRAM
-ReallyRetained_t rr;
+static ReallyRetained_t rr;
+
+/// A buffer used when printing out the time.
+static char timeBuf[32];
 
 /// A general purpose buffer, used for sending
 // and receiving UBX commands to/from the GNSS module.
-char msgBuffer[1024];
+static char msgBuffer[1024];
 
 /// A buffer used when sending messages to the server.
-char sendBuffer[LEN_RECORD_TYPE + LEN_RECORD_CONTENTS];
+static char sendBuffer[LEN_RECORD_TYPE + LEN_RECORD_CONTENTS];
 
 /// A UDP socket.
-UDPSocket udpSock;
+static UDPSocket udpSock;
 
 /// The address of the destination UDP server.
-SocketAddress udpServer;
+static SocketAddress udpServer;
 
 /// For hex printing.
 static const char hexTable[] =
@@ -564,31 +580,31 @@ static const uint8_t daysInMonthLeapYear[] =
 {31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
 
 /// Instantiate lower power helper
-LowPower lowPower;
+static LowPower lowPower;
 
 /// Instantiate the accelerometer.
-AccelerometerAdxl345 accelerometer;
+static AccelerometerAdxl345 accelerometer;
 
 /// Instantiate GNSS.
-GnssSerial gnss;
+static GnssSerial gnss;
 
-/// Instantiate the I2C used for device on board C030.
-I2C i2COnBoard(I2C_SDA_B, I2C_SCL_B);
+/// Instantiate the I2C used for devices on board C030.
+static I2C i2COnBoard(I2C_SDA_B, I2C_SCL_B);
 
-/// Instantiate the I2C used for device on the Arduino connector.
-I2C i2C(I2C_SDA, I2C_SCL);
+/// Instantiate the I2C used for devices on the Arduino connector.
+static I2C i2C(I2C_SDA, I2C_SCL);
 
 /// Instantiate a battery gauge.
-BatteryGaugeBq27441 batteryGauge;
+static BatteryGaugeBq27441 batteryGauge;
 
 /// Instantiate cellular.
-UbloxATCellularInterface cellular;
+static UbloxATCellularInterface cellular;
 
 /// Debug LED (blue).
-DigitalOut debugLed(LED3, 1);
+static DigitalOut debugLed(LED3, 1);
 
 /// To pass the time.
-Timer upTimer;
+static Timer upTimer;
 
 /****************************************************************
  * DEBUG
@@ -620,6 +636,7 @@ static void setLogFlag(uint32_t flag);
 static void clearLogFlag(uint32_t flag);
 static void logFlagsAsString(uint32_t flags);
 static uint32_t readGnssMsg (char *pBuffer, uint32_t bufferLen, int32_t waitMilliseconds);
+static bool waitAckGnssMsg(uint8_t msgClass, uint8_t msgId);
 static bool configureGnss();
 static bool gotGnssFix(float *pLatitude, float *pLongitude, float *pElevation, float *pHdop);
 static bool gnssGetTime(time_t *pUnixTimeUtc);
@@ -630,8 +647,10 @@ static time_t gnssOn();
 static bool gnssOff();
 static bool gnssIsOn();
 static bool gnssUpdate(float *pLatitude, float *pLongitude, float *pElevation, float *pHdop);
+static bool cellularGetTime(time_t *pTime);
 static bool connect();
 static bool send(RecordType_t type, const char *pContents);
+static char *timeString(time_t time);
 static bool isLeapYear(uint32_t year);
 static bool establishTime();
 static time_t getSleepTime(time_t lastTime, time_t period);
@@ -653,7 +672,8 @@ static bool sendQueuedReports(bool *pAtLeastOneGnssReportSent);
 
 /// Return a uint32_t from a pointer to a little-endian uint32_t
 // in memory.
-static uint32_t littleEndianUint32(char *pByte) {
+static uint32_t littleEndianUint32(char *pByte)
+{
     uint32_t retValue;
     
     retValue = *pByte;
@@ -665,7 +685,8 @@ static uint32_t littleEndianUint32(char *pByte) {
 }
 
 /// Reset the normally retained variables.
-static void resetRetained() {
+static void resetRetained()
+{
     LOG_MSG("Resetting retained memory to defaults.\n");
     memset (&r, 0, sizeof (r));
     strcpy (r.key, RETAINED_INITIALISED);
@@ -674,7 +695,8 @@ static void resetRetained() {
 }
 
 /// Reset the separate set of "really retained" variables.
-static void resetReallyRetained() {
+static void resetReallyRetained()
+{
     LOG_MSG("Resetting really retained memory to defaults.\n");
     memset (&rr, 0, sizeof (rr));
     strcpy (rr.key, RETAINED_INITIALISED);
@@ -684,7 +706,8 @@ static void resetReallyRetained() {
 
 /// Handle the accelerometer interrupt, returning true if activity
 // was detected, otherwise false.
-static bool handleInterrupt() {
+static bool handleInterrupt()
+{
     bool activityDetected = false;
     
     if (accelerometerConnected) {
@@ -711,7 +734,8 @@ static bool handleInterrupt() {
  ***************************************************************/
 
 /// Use the LED for debug indications.
-static void debugInd(DebugInd_t debugInd) {
+static void debugInd(DebugInd_t debugInd)
+{
     
     switch (debugInd) {
         case DEBUG_IND_OFF:
@@ -788,7 +812,8 @@ static void debugInd(DebugInd_t debugInd) {
 }
 
 /// Print an array of bytes as hex.
-static void printHex(const char *pBytes, uint32_t lenBytes) {
+static void printHex(const char *pBytes, uint32_t lenBytes)
+{
     char hexChar[2];
 
     for (uint32_t x = 0; x < lenBytes; x++)
@@ -801,26 +826,26 @@ static void printHex(const char *pBytes, uint32_t lenBytes) {
 }
 
 /// Print out retained RAM
-static void debugPrintRetained() {
-    char timeBuf[32];
+static void debugPrintRetained()
+{
     uint32_t x;
     
     LOG_MSG("Printing out retained RAM:\n");
-    LOG_MSG("  key: \"%s\".\n", r.key);
+    LOG_MSG("  key: \"%s\".\n", r.key); 
     LOG_MSG("  swVersion: %d.\n", (int) r.swVersion);
     LOG_MSG("  warmStart: %d.\n", r.warmStart);
     LOG_MSG("  gnssOn: %d.\n", r.gnssOn);
-    LOG_MSG("  sleepStartSeconds: %d UTC %s", (int) r.sleepStartSeconds, ctime(&r.sleepStartSeconds));
+    LOG_MSG("  sleepStartSeconds: %d (UTC %s).\n", (int) r.sleepStartSeconds, timeString(r.sleepStartSeconds));
     LOG_MSG("  minSleepPeriodSeconds: %d.\n", (int) r.minSleepPeriodSeconds);
     LOG_MSG("  sleepForSeconds: %d.\n", (int) r.sleepForSeconds);
     LOG_MSG("  modemStaysAwake: %d.\n", (int) r.modemStaysAwake);
     LOG_MSG("  imei: \"%s\".\n", r.imei);
-    LOG_MSG("  lastGnssSeconds: %d UTC %s", (int) r.lastGnssSeconds, ctime(&r.lastGnssSeconds));
-    LOG_MSG("  lastTelemetrySeconds: %d UTC %s", (int) r.lastTelemetrySeconds, ctime(&r.lastTelemetrySeconds));
-    LOG_MSG("  lastStatsSeconds: %d UTC %s", (int) r.lastStatsSeconds, ctime(&r.lastStatsSeconds));
-    LOG_MSG("  lastReportSeconds: %d UTC %s", (int) r.lastReportSeconds, ctime(&r.lastReportSeconds));
-    LOG_MSG("  lastMotionSeconds: %d UTC %s", (int) r.lastMotionSeconds, ctime(&r.lastMotionSeconds));
-    LOG_MSG("  lastColdStartSeconds: %d UTC %s", (int) r.lastColdStartSeconds, ctime(&r.lastColdStartSeconds));
+    LOG_MSG("  lastGnssSeconds: %d (UTC %s).\n", (int) r.lastGnssSeconds, timeString(r.lastGnssSeconds));
+    LOG_MSG("  lastTelemetrySeconds: %d (UTC %s).\n", (int) r.lastTelemetrySeconds, timeString(r.lastTelemetrySeconds));
+    LOG_MSG("  lastStatsSeconds: %d (UTC %s).\n", (int) r.lastStatsSeconds, timeString(r.lastStatsSeconds));
+    LOG_MSG("  lastReportSeconds: %d (UTC %s).\n", (int) r.lastReportSeconds, timeString(r.lastReportSeconds));
+    LOG_MSG("  lastMotionSeconds: %d (UTC %s).\n", (int) r.lastMotionSeconds, timeString(r.lastMotionSeconds));
+    LOG_MSG("  lastColdStartSeconds: %d (UTC %s).\n", (int) r.lastColdStartSeconds, timeString(r.lastColdStartSeconds));
     LOG_MSG("  gnssFixRequested: %d.\n", r.gnssFixRequested);
     LOG_MSG("  nextFreeRecord: %u.\n", (unsigned int) r.nextFreeRecord);
     LOG_MSG("  nextPubRecord: %u.\n", (unsigned int) r.nextPubRecord);
@@ -834,7 +859,7 @@ static void debugPrintRetained() {
         }
     }
 
-    LOG_MSG("  powerSaveTime: %d UTC %s", (int) r.powerSaveTime, ctime(&r.powerSaveTime));
+    LOG_MSG("  powerSaveTime: %d (UTC %s).\n", (int) r.powerSaveTime, timeString(r.powerSaveTime));
     LOG_MSG("  numLoops: %u.\n", (unsigned int) r.numLoops);
     LOG_MSG("  numLoopsMotionDetected: %u.\n", (unsigned int) r.numLoopsMotionDetected);
     LOG_MSG("  numLoopsLocationNeeded: %u.\n", (unsigned int) r.numLoopsLocationNeeded);
@@ -842,7 +867,7 @@ static void debugPrintRetained() {
     LOG_MSG("  numLoopsGnssFix: %u.\n", (unsigned int) r.numLoopsGnssFix);
     LOG_MSG("  numLoopsLocationValid: %u.\n", (unsigned int) r.numLoopsLocationValid);
     LOG_MSG("  totalPowerSaveSeconds: %u.\n", (unsigned int) r.totalPowerSaveSeconds);
-    LOG_MSG("  gnssPowerOnTime: %d UTC %s", (int) r.gnssPowerOnTime, ctime(&r.gnssPowerOnTime));
+    LOG_MSG("  gnssPowerOnTime: %d (UTC %s).\n", (int) r.gnssPowerOnTime, timeString(r.gnssPowerOnTime));
     LOG_MSG("  gnssSeconds: %u.\n", (unsigned int) r.gnssSeconds);
     LOG_MSG("  totalGnssSeconds: %u.\n", (unsigned int) r.totalGnssSeconds);
     LOG_MSG("  numPublishAttempts: %u.\n", (unsigned int) r.numPublishAttempts);
@@ -858,14 +883,14 @@ static void debugPrintRetained() {
     LOG_MSG(").\n");
     LOG_MSG("  numLogFlagsEntries: %d.\n", rr.numLogFlagsEntries);
     for (x = 0; x < rr.numLogFlagsEntries; x++) {
-        strftime(timeBuf, sizeof (timeBuf), "%F %X", gmtime(&rr.logFlagsEntries[x].timestamp));
-        LOG_MSG("%02d:  %s - ", (int) (x + 1), timeBuf);
+        LOG_MSG("%02d:  %s - ", (int) (x + 1), timeString(rr.logFlagsEntries[x].timestamp));
         logFlagsAsString(rr.logFlagsEntries[x].flags);
     }
 }
 
 /// Start a new entry in the log flags.
-static void addLogFlagsEntry() {
+static void addLogFlagsEntry()
+{
     int32_t x;
     
     // Increment the count
@@ -886,22 +911,24 @@ static void addLogFlagsEntry() {
 }
 
 // Set a log flag in the current log flags entry
-static void setLogFlag(uint32_t flag) {
+static void setLogFlag(uint32_t flag)
+{
     if (rr.numLogFlagsEntries > 0) {
         rr.logFlagsEntries[rr.numLogFlagsEntries - 1].flags |= flag;
     }
 }
 
 // Clear a log flag in the current log flags entry
-static void clearLogFlag(uint32_t flag) {
+static void clearLogFlag(uint32_t flag)
+{
     if (rr.numLogFlagsEntries > 0) {
         rr.logFlagsEntries[rr.numLogFlagsEntries - 1].flags &= ~flag;
     }
 }
 
 // Print a string describing a set of log flags
-static void logFlagsAsString(uint32_t flags) {
-
+static void logFlagsAsString(uint32_t flags)
+{
     if (flags & LOG_FLAG_STARTUP_NOT_LOOP_ENTRY)     {
         LOG_MSG("Startup: ");
         if (flags & LOG_FLAG_STARTUP_WARM_NOT_COLD) {
@@ -1007,16 +1034,19 @@ static void logFlagsAsString(uint32_t flags) {
 /// Read a UBX format GNSS message into a buffer.  If waitMilliseconds
 // is zero then don't hang around except for the intercharacter delay,
 // otherwise wait up to waitMilliseconds for the message.
-static uint32_t readGnssMsg(char *pBuffer, uint32_t bufferLen, int32_t waitMilliseconds) {
+static uint32_t readGnssMsg(char *pBuffer, uint32_t bufferLen, int32_t waitMilliseconds)
+{
     uint32_t returnCode;
     uint32_t length = 0;
     Timer timer;
 
     timer.start();
     while (((returnCode = gnss.getMessage(pBuffer, bufferLen)) > 0) &&
-           (PROTOCOL(returnCode) == GnssParser::UBX) &&
-           timer.read_ms() < waitMilliseconds) {
-        length = LENGTH(returnCode);
+           (timer.read_ms() < waitMilliseconds) &&
+           (length == 0)) {
+        if (PROTOCOL(returnCode) == GnssParser::UBX) {
+            length = LENGTH(returnCode);
+        }
     }
     timer.stop();
 
@@ -1034,10 +1064,44 @@ static uint32_t readGnssMsg(char *pBuffer, uint32_t bufferLen, int32_t waitMilli
     return length;
 }
 
+/// Check for an ack for a GNSS message.
+// See ublox7-V14_ReceiverDescrProtSpec section 33 (ACK).
+// NOTE: this re-uses msgBuffer.
+static bool waitAckGnssMsg(uint8_t msgClass, uint8_t msgId)
+{
+    bool ack = false;
+    bool gotAckOrNack = false;
+    Timer timer;
+
+    LOG_MSG("  > ");
+    // Wait around for a message that is an ack
+    timer.start();
+    while (!gotAckOrNack && (timer.read_ms() < GNSS_WAIT_FOR_ACK_MILLISECONDS)) {
+        if (readGnssMsg(msgBuffer, sizeof (msgBuffer), GNSS_WAIT_FOR_RESPONSE_MILLISECONDS) == 10) { // 10 is the Ack message size
+            // Ack is  0xb5-62-05-00-02-00-msgclass-msgid-crcA-crcB
+            // Nack is 0xb5-62-05-01-02-00-msgclass-msgid-crcA-crcB
+            if ((msgBuffer[4] == 2) && (msgBuffer[5] == 0) && (msgBuffer[6] == msgClass) && (msgBuffer[7] == msgId) && (msgBuffer[2] == 0x05)) {
+                gotAckOrNack = true;
+                if (msgBuffer[3] == 0x01) {
+                    ack = true;
+                    LOG_MSG("  > [Ack]\n");
+                } else {
+                    LOG_MSG("!!> [Nack]\n");
+                }
+            }
+        }
+    }
+    timer.stop();
+
+    return ack;
+}
+
 /// Configure the GNSS module.
 // NOTE: it is up to the caller to make sure that the module is powered up.
-static bool configureGnss() {
-    bool success = true;
+static bool configureGnss()
+{
+    bool success1 = false;
+    bool success2 = false;
 
     LOG_MSG("Configuring GNSS...\n");
     
@@ -1047,7 +1111,7 @@ static bool configureGnss() {
     msgBuffer[0] = 0x00; // Set dynamic config only
     msgBuffer[1] = 0x01;
     msgBuffer[2] = 0x04; // Automotive
-    success = (gnss.sendUbx(0x06, 0x24, msgBuffer, 36) >= 0);
+    success1 = (gnss.sendUbx(0x06, 0x24, msgBuffer, 36) >= 0) && waitAckGnssMsg(0x06, 0x24);
 
     // See ublox7-V14_ReceiverDescrProtSpec section 35.2 (CFG-CFG)
     LOG_MSG("Storing settings in battery-backed RAM (CFG-CFG)...\n");
@@ -1066,13 +1130,15 @@ static bool configureGnss() {
     msgBuffer[10] = 0x06;
     msgBuffer[11] = 0x1F;
     msgBuffer[12] = 0x01;  // Save in BBR
-    success = (gnss.sendUbx(0x06, 0x09, msgBuffer, 13) >= 0);
+    success2 = (gnss.sendUbx(0x06, 0x09, msgBuffer, 13) >= 0) && waitAckGnssMsg(0x06, 0x09);
 
-    return success;
+    return success1 && success2;
 }
 
 /// Return true if we have a GNSS fix and fill in any given parameters (any of which may be NULL).
-static bool gotGnssFix(float *pLatitude, float *pLongitude, float *pElevation, float *pHdop) {
+// NOTE: it is up to the caller to make sure that the module is powered up.
+static bool gotGnssFix(float *pLatitude, float *pLongitude, float *pElevation, float *pHdop)
+{
     bool gotFix = false;
     float longitude;
     float latitude;
@@ -1145,7 +1211,9 @@ static bool gotGnssFix(float *pLatitude, float *pLongitude, float *pElevation, f
 }
 
 /// Read the time from the GNSS module
-static bool gnssGetTime(time_t *pUnixTimeUtc) {
+// NOTE: it is up to the caller to make sure that the module is powered up.
+static bool gnssGetTime(time_t *pUnixTimeUtc)
+{
     time_t gnssTime = 0;
     bool success = false;
     uint32_t months;
@@ -1153,9 +1221,6 @@ static bool gnssGetTime(time_t *pUnixTimeUtc) {
     uint32_t x;
     bool switchGnssOffAgain = !gnssIsOn();
 
-    // Make sure GNSS is on
-    gnssOn();
-    
     // See ublox7-V14_ReceiverDescrProtSpec section 39.13 (NAV-TIMEUTC)
     LOG_MSG("Reading time from GNSS (NAV-TIMEUTC)...\n");
     if (gnss.sendUbx(0x01, 0x21, NULL, 0) >= 0) {
@@ -1184,7 +1249,7 @@ static bool gnssGetTime(time_t *pUnixTimeUtc) {
                 // Second (0 to 60)
                 gnssTime += msgBuffer[18 + GNSS_UBX_PROTOCOL_HEADER_SIZE];
                 
-                LOG_MSG("GNSS time is %s", ctime(&gnssTime));
+                LOG_MSG("GNSS time is %s.\n", timeString(gnssTime));
     
                 success = true;
                 if (pUnixTimeUtc != NULL) {
@@ -1214,7 +1279,8 @@ static bool gnssGetTime(time_t *pUnixTimeUtc) {
 // calibrated its RTC.  There is also a timeout check.
 // NOTE: it is up to the caller to check separately if we
 // have the required accuracy of fix.
-static bool gnssCanPowerSave() {
+static bool gnssCanPowerSave()
+{
     bool canPowerSave = false;
 
     LOG_MSG("Checking if GNSS can power save...\n");
@@ -1322,14 +1388,14 @@ static bool gnssCanPowerSave() {
 }
 
 /// Switch GNSS on, returning the time that GNSS was switched on.
-static time_t gnssOn() {
-
+static time_t gnssOn()
+{
     if (!r.gnssOn) {        
         r.gnssOn = gnss.init();
         if (r.gnssOn) {
             // Log the time that GNSS was switched on
             r.gnssPowerOnTime = time(NULL);
-            LOG_MSG("VCC applied to GNSS.\n");
+            LOG_MSG("GNSS initialised.\n");
             setLogFlag(LOG_FLAG_GNSS_ON_NOT_OFF);
         }
     }
@@ -1338,7 +1404,8 @@ static time_t gnssOn() {
 }
 
 /// Switch GNSS off.
-static bool gnssOff() {
+static bool gnssOff()
+{
     // Record the duration that GNSS was on for
     uint32_t x = time(NULL) - r.gnssPowerOnTime;
     
@@ -1351,14 +1418,14 @@ static bool gnssOff() {
 
     gnss.powerOff();
     r.gnssOn = false;
-    LOG_MSG("GNSS off.\n");
     clearLogFlag(LOG_FLAG_GNSS_ON_NOT_OFF);
     
     return true;
 }
 
 /// Return true if GNSS is on, otherwise false.
-static bool gnssIsOn() {
+static bool gnssIsOn()
+{
     return r.gnssOn;
 }
 
@@ -1367,7 +1434,8 @@ static bool gnssIsOn() {
 // pHdop and are filled in with fix values and their accuracy
 // if a fix is achieved (and true is returned), otherwise
 // they are left alone.
-static bool gnssUpdate(float *pLatitude, float *pLongitude, float *pElevation, float *pHdop) {
+static bool gnssUpdate(float *pLatitude, float *pLongitude, float *pElevation, float *pHdop)
+{
     bool fixAchieved = false;
     uint32_t startTimeSeconds = time(NULL);
 
@@ -1433,8 +1501,62 @@ static bool gnssUpdate(float *pLatitude, float *pLongitude, float *pElevation, f
  * STATIC FUNCTIONS: MODEM
  ***************************************************************/
 
+/// Set the time using a NTP server
+static bool cellularGetTime(time_t *pTime)
+{
+    bool success = false;
+    UDPSocket sockTime;
+    SocketAddress serverTime;
+    SocketAddress senderAddressTime;
+    char buf[48];
+    int x;
+    time_t timestamp = 0;
+    
+    LOG_MSG("Powering up cellular to get time...\n");
+    cellular.init();
+    cellular.set_credentials(APN, USERNAME, PASSWORD);
+    printf("Connecting to the packet network ...\n");
+    for (x = 0; (cellular.connect() != 0) && (x < CONNECT_RETRIES); x++) {
+        printf("Retrying (have you checked that an antenna is plugged in and your APN is correct?)...\n");
+        wait_ms(1000);
+    }
+    
+    if (cellular.is_connected()) {
+        if (cellular.gethostbyname("2.pool.ntp.org", &serverTime) == 0) {
+            serverTime.set_port(123);
+            printf("\"2.pool.ntp.org\" address: %s on port %d.\n", serverTime.get_ip_address(), serverTime.get_port());
+            if (sockTime.open(&cellular) == 0) {
+                sockTime.set_timeout(10000);
+                printf("Sending time request to \"2.pool.ntp.org\" over UDP socket...\n");
+                memset (buf, 0, sizeof(buf));
+                *buf = '\x1b';
+                if (sockTime.sendto(serverTime, (void *) buf, sizeof(buf)) == sizeof(buf)) {
+                    x = sockTime.recvfrom(&senderAddressTime, buf, sizeof (buf));
+                    if (x >= 43) {
+                        success = true;
+                        timestamp |= ((int) *(buf + 40)) << 24;
+                        timestamp |= ((int) *(buf + 41)) << 16;
+                        timestamp |= ((int) *(buf + 42)) << 8;
+                        timestamp |= ((int) *(buf + 43));
+                        timestamp -= 2208988800U; // to get the timestamp offset from 1970;
+                        LOG_MSG("Network time is %s.\n", timeString(timestamp));
+                        if (pTime != NULL) {
+                            *pTime = timestamp;
+                        }
+                    }
+                }
+                sockTime.close();
+            }
+        }    
+        cellular.disconnect();
+    }
+    
+    return success;
+}
+ 
 /// Connect to the network, returning true if successful.
-static bool connect() {
+static bool connect()
+{
     bool success = false;
     
 #ifdef DISABLE_CELLULAR_CONNECTION
@@ -1445,19 +1567,28 @@ static bool connect() {
         setLogFlag(LOG_FLAG_MODEM_CONNECTED);
     } else {
         r.numConnectAttempts++;
+        LOG_MSG("Making sure modem is powered up...\n");
+        cellular.init(PIN);
+        cellular.set_credentials(APN, USERNAME, PASSWORD);
         LOG_MSG("Connecting to the packet network...\n");
-        for (int x = 0; cellular.connect() != 0; x++) {
-            if (x > 0) {
-                LOG_MSG("Retrying (have you checked that an antenna is plugged in and your APN is correct?)...\n");
-            }
+        for (int x = 0; (cellular.connect() != 0) && (x < CONNECT_RETRIES); x++) {
+            LOG_MSG("Retrying (have you checked that an antenna is plugged in and your APN is correct?)...\n");
+            wait_ms(1000);
         }
         if (cellular.is_connected()) {
             printf("Getting the IP address of \"%s\"...\n", SERVER_ADDRESS);
             if (cellular.gethostbyname(SERVER_ADDRESS, &udpServer) == 0) {
                 udpServer.set_port(SERVER_PORT);
                 LOG_MSG("\%s\" address: %s on port %d.\n", SERVER_ADDRESS, udpServer.get_ip_address(), udpServer.get_port());
-                udpSock.set_timeout(WAIT_FOR_PUBLISH_SECONDS * 1000);
-                setLogFlag(LOG_FLAG_MODEM_CONNECTED);
+                if (udpSock.open(&cellular) == 0) {
+                    success = true;
+                    udpSock.set_timeout(WAIT_FOR_PUBLISH_SECONDS * 1000);
+                    setLogFlag(LOG_FLAG_MODEM_CONNECTED);
+                } else {
+                    setLogFlag(LOG_FLAG_CONNECT_FAILED);
+                    r.numConnectFailed++;
+                    LOG_MSG("Couldn't open UDP socket.\n");
+                }
             } else {
                 setLogFlag(LOG_FLAG_CONNECT_FAILED);
                 r.numConnectFailed++;
@@ -1475,7 +1606,8 @@ static bool connect() {
 }
 
 /// Send stuff
-static bool send(RecordType_t type, const char *pContents) {
+static bool send(RecordType_t type, const char *pContents)
+{
     bool success = false;
     int typeLen;
     int contentsLen;
@@ -1507,8 +1639,19 @@ static bool send(RecordType_t type, const char *pContents) {
  * STATIC FUNCTIONS: TIME
  ***************************************************************/
 
+/// Return a string expressing time.
+// Note: sometimes gmtime returns the value of zero time,
+// even through the time value passed in clearly is not
+// zero; not sure why.
+static char *timeString(time_t time)
+{
+    strftime(timeBuf, sizeof (timeBuf), "%F %X", gmtime(&time));
+    return timeBuf;
+}
+
 /// Check if a year is a leap year
-static bool isLeapYear(uint32_t year) {
+static bool isLeapYear(uint32_t year)
+{
     bool leapYear = false;
 
     if (year % 400 == 0) {
@@ -1521,16 +1664,27 @@ static bool isLeapYear(uint32_t year) {
 }
 
 /// Make sure we have time sync.
-static bool establishTime() {
+static bool establishTime()
+{
     bool success = false;
-    time_t gnssTime = 0;
+    time_t newTime = 0;
     time_t tNow = time(NULL);
 
     if (tNow <= MIN_TIME_UNIX_UTC) {
-        if (gnssGetTime(&gnssTime) && (gnssTime > MIN_TIME_UNIX_UTC)) {
-            LOG_MSG("time(NULL) reported (in UTC) as %sUsing GNSS time instead (%s)\n", ctime(&tNow), ctime(&gnssTime));
-            set_time(gnssTime);
+        LOG_MSG("time(NULL) reported as UTC %s.\n", timeString(tNow));
+        if (gnssGetTime(&newTime)) {
+            set_time(newTime);
+            tNow = time(NULL);
+            LOG_MSG("Using GNSS time instead, UTC %s", timeString(tNow));
             setLogFlag(LOG_FLAG_TIME_ESTABLISHED_VIA_GNSS);
+        } else {
+            // Set time using cellular
+            if (cellularGetTime(&newTime)) {
+                set_time(newTime);
+                tNow = time(NULL);
+                LOG_MSG("Using cellular time instead UTC %s.\n", timeString(tNow));
+                setLogFlag(LOG_FLAG_TIME_ESTABLISHED_VIA_NETWORK);
+            }
         }
     } else {
         setLogFlag(LOG_FLAG_TIME_ESTABLISHED_VIA_RTC);
@@ -1554,7 +1708,8 @@ static bool establishTime() {
 
 /// Get the sleep time to the next event given the last time the event occurred and
 // it's periodicity
-static time_t getSleepTime(time_t lastTime, time_t period) {
+static time_t getSleepTime(time_t lastTime, time_t period)
+{
     time_t sleepDuration = period;
     
     if ((lastTime > 0) && (lastTime < time(NULL))) {
@@ -1568,7 +1723,8 @@ static time_t getSleepTime(time_t lastTime, time_t period) {
 }
 
 /// Sort out our timings after waking up to do something
-static time_t setTimings(uint32_t secondsSinceMidnight, bool atLeastOneGnssReportSent, bool fixAchieved, time_t *pMinSleepPeriodSeconds) {
+static time_t setTimings(uint32_t secondsSinceMidnight, bool atLeastOneGnssReportSent, bool fixAchieved, time_t *pMinSleepPeriodSeconds)
+{
     time_t x;
     uint32_t numIntervalsPassed;
     time_t minSleepPeriodSeconds = MIN_MOTION_PERIOD_SECONDS;
@@ -1601,23 +1757,23 @@ static time_t setTimings(uint32_t secondsSinceMidnight, bool atLeastOneGnssRepor
         // The things that can wake us up are queueing telemetry reports, queuing stats reports
         // and actually sending off the accumulated reports
         x = getSleepTime(r.lastTelemetrySeconds, TELEMETRY_PERIOD_SECONDS);
-        LOG_MSG("  Next wake-up to record telemetry is in %d second(s), last was at UTC %s",
-                 (int) x, ctime(&r.lastTelemetrySeconds));
+        LOG_MSG("  Next wake-up to record telemetry is in %d second(s) (last was UTC %s).\n",
+                 (int) x, timeString(r.lastTelemetrySeconds));
         if (x < sleepForSeconds) {
             sleepForSeconds = x;
             LOG_MSG("    Next wake-up set to %d second(s).\n", (int) x);
         }
         x = getSleepTime (r.lastStatsSeconds, statsPeriodSeconds);
-        LOG_MSG("  Next wake-up to record stats is in %d second(s), last was at UTC %s",
-                (int) x, ctime(&r.lastStatsSeconds));
+        LOG_MSG("  Next wake-up to record stats is in %d second(s) (last was UTC %s).\n",
+                (int) x, timeString(r.lastStatsSeconds));
         if (x < sleepForSeconds) {
             sleepForSeconds = x;
             LOG_MSG("    Next wake-up set to %d second(s).\n", (int) x);
         }
         if (r.numRecordsQueued > 0) {
             x = getSleepTime (r.lastReportSeconds, REPORT_PERIOD_SECONDS);
-            LOG_MSG("  Next wake-up to send the %d queued report(s) is in %d second(s), last was at UTC %s",
-                    (int) r.numRecordsQueued, (int) x, ctime(&r.lastReportSeconds));
+            LOG_MSG("  Next wake-up to send the %d queued report(s) is in %d second(s) (last was UTC %s).\n",
+                    (int) r.numRecordsQueued, (int) x, timeString(r.lastReportSeconds));
             if (x < sleepForSeconds) {
                 sleepForSeconds = x;
                 LOG_MSG("    Next wake-up set to %d second(s).\n", (int) x);
@@ -1671,7 +1827,8 @@ static time_t setTimings(uint32_t secondsSinceMidnight, bool atLeastOneGnssRepor
 }
 
 /// Calculate the number of seconds in the day to the start of the working day.
-static uint32_t secondsInDayToWorkingDayStart(uint32_t secondsToday) {
+static uint32_t secondsInDayToWorkingDayStart(uint32_t secondsToday)
+{
     uint32_t seconds = 0;
     struct tm *pT;
     struct tm tNow;
@@ -1700,18 +1857,18 @@ static uint32_t secondsInDayToWorkingDayStart(uint32_t secondsToday) {
         pT = gmtime(&t);
         memcpy(&tEnd, pT, sizeof (tEnd));
         t = time(NULL) + seconds;
-        LOG_MSG("Time now %02d:%02d:%02d UTC, working day is %02d:%02d:%02d to %02d:%02d:%02d, going back to sleep for %d second(s) in order to wake up at %s",
+        LOG_MSG("Time now %02d:%02d:%02d UTC, working day is %02d:%02d:%02d to %02d:%02d:%02d, going back to sleep for %d second(s) in order to wake up at UTC %s.\n",
                 tNow.tm_hour, tNow.tm_min, tNow.tm_sec,
                 tStart.tm_hour, tStart.tm_min, tStart.tm_sec,
                 tEnd.tm_hour, tEnd.tm_min, tEnd.tm_sec,
-                (int) seconds, ctime(&t));
+                (int) seconds, timeString(t));
     }
     // If we will still be in slow mode when we awake, no need to wake up until the first slow-operation
     // wake-up time
     if (time(NULL) + seconds < START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC) {
         seconds += SLOW_MODE_INTERVAL_SECONDS;
-        LOG_MSG("Adding %d second(s) to wake-up time as we're in slow operation mode, so will actually wake up at %s\n",
-                SLOW_MODE_INTERVAL_SECONDS, ctime(&t));
+        LOG_MSG("Adding %d second(s) to wake-up time as we're in slow operation mode, so will actually wake up at UTC %s.\n",
+                SLOW_MODE_INTERVAL_SECONDS, timeString(t));
     }
     
     return seconds;
@@ -1720,12 +1877,14 @@ static uint32_t secondsInDayToWorkingDayStart(uint32_t secondsToday) {
 /// Work out the unix time for midnight on a given day.  In other
 // words, truncate a unixTime to a day (so 08:00 on 24th June becomes
 // 00:00 on 24th June).
-static time_t truncateToDay(time_t unixTime) {
+static time_t truncateToDay(time_t unixTime)
+{
     return (unixTime / (3600 * 24)) * 3600 * 24;
 }
 
 /// Do a limits check of the sleep time.
-static time_t sleepLimitsCheck(time_t sleepForSeconds) {
+static time_t sleepLimitsCheck(time_t sleepForSeconds)
+{
     
     if (sleepForSeconds < 0) {
         LOG_MSG("WARNING: sleep period went negative (%d second(s)), setting it to zero.\n", (int) sleepForSeconds);
@@ -1739,7 +1898,8 @@ static time_t sleepLimitsCheck(time_t sleepForSeconds) {
 }
 
 /// check if we are still in motion by checking how long it has been since the last accelerometer nudge
-static bool stillWithinMotionDelaySinceLastAcceleration(time_t lastAccelerometerNudge, time_t timeNow) {
+static bool stillWithinMotionDelaySinceLastAcceleration(time_t lastAccelerometerNudge, time_t timeNow)
+{
     return (timeNow <= (lastAccelerometerNudge + IN_MOTION_TIME_SECONDS));
 }
 
@@ -1748,7 +1908,8 @@ static bool stillWithinMotionDelaySinceLastAcceleration(time_t lastAccelerometer
  ***************************************************************/
 
 /// Get a new record from the list.
-static char *getRecord(RecordType_t type) {
+static char *getRecord(RecordType_t type)
+{
     char *pContents;
 
     LOG_MSG("Using record %d.\n", (int) r.nextFreeRecord);
@@ -1775,7 +1936,8 @@ static char *getRecord(RecordType_t type) {
 }
 
 /// Free a record.
-static void freeRecord(Record_t *pRecord) {
+static void freeRecord(Record_t *pRecord)
+{
     if (pRecord != NULL) {
         pRecord->isUsed = false;
         if (r.numRecordsQueued > 0) {
@@ -1786,7 +1948,8 @@ static void freeRecord(Record_t *pRecord) {
 
 /// Increment a number and return the incremented
 // number modulo the number of records available.
-static uint32_t incModRecords (uint32_t x) {
+static uint32_t incModRecords (uint32_t x)
+{
     x++;
     if (x >= (sizeof (r.records) / sizeof (r.records[0]))) {
         x = 0;
@@ -1796,7 +1959,8 @@ static uint32_t incModRecords (uint32_t x) {
 }
 
 /// Queue a telemetry report.
-static void queueTelemetryReport() {
+static void queueTelemetryReport()
+{
     char *pRecord;
     uint32_t contentsIndex = 0;
     int32_t batteryPercent = 0;
@@ -1831,7 +1995,7 @@ static void queueTelemetryReport() {
     // Add Unix time
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD_CONTENTS)) {
         contentsIndex += snprintf(pRecord + contentsIndex, LEN_RECORD_CONTENTS - contentsIndex - 1, ";%u", (unsigned int) time(NULL));  // -1 for terminator
-        LOG_MSG("Time now (UTC) is %s", ctime(&t));
+        LOG_MSG("Time now is UTC %s.\n", timeString(t));
     } else {
         LOG_MSG("WARNING: couldn't fit timestamp into report.\n");
     }
@@ -1849,7 +2013,8 @@ static void queueTelemetryReport() {
 }
 
 /// Queue a GNSS report.
-static void queueGnssReport(float latitude, float longitude, bool motion, float hdop) {
+static void queueGnssReport(float latitude, float longitude, bool motion, float hdop)
+{
     char *pRecord;
     uint32_t contentsIndex = 0;
     time_t t = time(NULL);
@@ -1872,7 +2037,7 @@ static void queueGnssReport(float latitude, float longitude, bool motion, float 
     // Add Unix time
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD_CONTENTS)) {
         contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD_CONTENTS - contentsIndex - 1, ";%u", (unsigned int) time(NULL));  // -1 for terminator
-        LOG_MSG("Time now (UTC) is %s", ctime(&t));
+        LOG_MSG("Time now is UTC %s.\n", timeString(t));
     } else {
         LOG_MSG("WARNING: couldn't fit timestamp into report.\n");
     }
@@ -1898,7 +2063,8 @@ static void queueGnssReport(float latitude, float longitude, bool motion, float 
 }
 
 /// Queue a stats report.
-static void queueStatsReport() {
+static void queueStatsReport()
+{
     char *pRecord;
     uint32_t contentsIndex = 0;
     uint32_t upTimeSeconds = upTimer.read_ms() / 1000 + r.totalPowerSaveSeconds;
@@ -1990,7 +2156,7 @@ static void queueStatsReport() {
     // Add Unix time
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD_CONTENTS)) {
         contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD_CONTENTS - contentsIndex - 1, ";%u", (unsigned int) time(NULL));  // -1 for terminator
-        LOG_MSG("Time now is UTC %s", ctime(&t));
+        LOG_MSG("Time now is UTC %s.\n", timeString(t));
     } else {
         LOG_MSG("WARNING: couldn't fit timestamp into report.\n");
     }
@@ -2000,7 +2166,8 @@ static void queueStatsReport() {
 }
 
 /// Send the queued reports, returning true if all have been sent.
-static bool sendQueuedReports(bool *pAtLeastOneGnssReportSent) {
+static bool sendQueuedReports(bool *pAtLeastOneGnssReportSent)
+{
     bool atLeastOneGnssReportSent = false;
     uint32_t sentCount = 0;
     uint32_t failedCount = 0;
@@ -2086,7 +2253,8 @@ static bool sendQueuedReports(bool *pAtLeastOneGnssReportSent) {
  * STATIC FUNCTIONS: SETUP() AND LOOP() FROM THE PARTICLE CODE
  ***************************************************************/
 
-static void setup() {
+static void setup()
+{
     bool gnssConfigured = false;
     
     LOG_MSG("\n-> Starting up.\n");
@@ -2118,25 +2286,27 @@ static void setup() {
     // Set the debug LED off
     debugInd(DEBUG_IND_OFF);
 
-    // Get the IMEI of the modem module
+    // Get the IMEI of the modem module and, while
+    // we're doing that, set the right time
     if (r.imei[0] < '0') {
+        LOG_MSG("Powering up cellular to get IMEI...\n");
         cellular.init();
         wait_ms(MODEM_POWER_ON_DELAY_MILLISECONDS);
         LOG_MSG("Getting IMEI...\n");
         strcpy(r.imei, cellular.imei());
-        cellular.deinit();
-    } else {
         LOG_MSG("IMEI is: %.*s.\n", IMEI_LENGTH, r.imei);
     }
 
     // Start GNSS
     // NOTE: need to do this before establishing time as we access the
     // GNSS module during that process
-    gnss.init();
+    if (!gnss.init()) {
+        LOG_MSG("WARNING: unable to power up GNSS but continuing anyway.\n");
+    }
 
     // Establish time
     establishTime();
-
+    
 #ifdef DISABLE_ACCELEROMETER
     accelerometerConnected = false;
 #else
@@ -2176,7 +2346,7 @@ static void setup() {
         LOG_MSG("WARNING: couldn't initialise battery gauge but continuing anyway.\n");
     }
     
-    // If GNSS was on make sure it remains so
+    // If GNSS was off make sure it stays off
     if (!r.gnssOn) {
         gnssOff();
     } else {
@@ -2203,7 +2373,8 @@ static void setup() {
     LOG_MSG("Start-up completed.\n");
 }
 
-static void loop() {
+static void loop()
+{
     bool forceSend = false;
     bool wakeOnAccelerometer = false;
     bool atLeastOneGnssReportSent = false;
@@ -2231,8 +2402,8 @@ static void loop() {
     // This only for info
     r.numLoops++;
     tNow = time(NULL);
-    LOG_MSG("\n-> Starting loop %d at UTC %s->... having power saved since %d second(s) ago, UTC %s", (unsigned int) r.numLoops,
-            ctime(&tNow), (int) (tNow - r.powerSaveTime), ctime(&r.powerSaveTime));
+    LOG_MSG("\n-> Starting loop %d at %d (UTC %s) having power saved since %d second(s) ago (UTC %s).\n", (unsigned int) r.numLoops,
+            (int) tNow, timeString(tNow), (int) (tNow - r.powerSaveTime), timeString(r.powerSaveTime));
 
     // If we are in slow operation override the stats timer period
     // so that it is more frequent; it is useful to see these stats in
@@ -2312,7 +2483,8 @@ static void loop() {
                         r.lastTelemetrySeconds = time(NULL);
                         // Switch the modem on for this so that we can get the RSSI and,
                         // in any case, we will be forcing a send
-                        cellular.init();
+                        cellular.init(PIN);
+                        cellular.set_credentials(APN, USERNAME, PASSWORD);
                         wait_ms(MODEM_POWER_ON_DELAY_MILLISECONDS);
                         queueTelemetryReport();
                         LOG_MSG("Forcing a send.\n");
@@ -2386,6 +2558,7 @@ static void loop() {
                             resetRetained();
                             LOG_MSG("Switching modem and GNSS off at the end of this \"slow mode\" wake-up.\n");
                             gnssOff();
+                            cellular.deinit();
                             r.modemStaysAwake = false;
                             wakeOnAccelerometer = false;
                         }
@@ -2417,13 +2590,14 @@ static void loop() {
                 r.sleepForSeconds = secondsInDayToWorkingDayStart(secondsSinceMidnight);
                // Make sure GNSS and the modem are off
                 gnssOff();
+                cellular.deinit();
                 r.modemStaysAwake = false;
             } // END else condition of if() we're inside the working day
         } else { // END if() time >= START_TIME_UNIX_UTC
             t = START_TIME_UNIX_UTC;
             tNow = time(NULL);
-            LOG_MSG("Awake before start time:\n time now (UTC) %s start time (UTC) %s", 
-                    ctime(&tNow), ctime(&t));
+            LOG_MSG("Awake before start time:\n time now UTC %s, start time UTC %s.\n", 
+                    timeString(tNow), timeString(t));
             // Clear the retained and "really retained" variables as we'd like a fresh start when we awake
             resetRetained();
             resetReallyRetained();
@@ -2432,6 +2606,7 @@ static void loop() {
             r.sleepForSeconds = START_TIME_UNIX_UTC - time(NULL);
             // Make sure GNSS and the modem are off
             gnssOff();
+            cellular.deinit();
             r.modemStaysAwake = false;
 
             // If we will still be in slow mode when we awake, no need to wake up until the first interval of the working day expires
@@ -2470,8 +2645,8 @@ static void loop() {
 
     // Print a load of informational stuff
     t = time(NULL) + r.sleepForSeconds;
-    LOG_MSG("-> Ending loop %u: now sleeping for up to %d second(s) with a minimum of %d second(s), will awake at UTC %s",
-             (unsigned int) r.numLoops, (int) r.sleepForSeconds, (int) r.minSleepPeriodSeconds, ctime(&t));
+    LOG_MSG("-> Ending loop %u: now sleeping for up to %d second(s) with a minimum of %d second(s), will awake at UTC %s.\n",
+             (unsigned int) r.numLoops, (int) r.sleepForSeconds, (int) r.minSleepPeriodSeconds, timeString(t));
     LOG_MSG("-> The modem will ");
     setLogFlag(LOG_FLAG_FREE_1);
     if (r.modemStaysAwake) {
@@ -2480,10 +2655,10 @@ static void loop() {
         LOG_MSG("be OFF");
     }
     if (cellular.is_connected()) {
-        setLogFlag(LOG_FLAG_FREE_3);
+        setLogFlag(LOG_FLAG_FREE_2);
         LOG_MSG(" (it is currently CONNECTED)");
     }
-    setLogFlag(LOG_FLAG_FREE_4);
+    setLogFlag(LOG_FLAG_FREE_3);
     LOG_MSG(", GNSS will be ");
     if (gnssIsOn()) {
         LOG_MSG("ON");
@@ -2558,20 +2733,16 @@ int main()
     // able to enter Standby mode
     lowPower.exitDebugMode();
     
+    // Make sure the external wakeup pin is enabled
+    HAL_PWR_EnableWakeUpPin(PWR_WAKEUP_PIN1);
+    
     // Do all the setup stuff
     setup();
     
-    // Set up cellular;
-    LOG_MSG("Initialising modem...\n");
-    if (cellular.init(PIN)) {
-        cellular.set_credentials(APN, USERNAME, PASSWORD);
-        // Run the loop forever
-        upTimer.start();
-        while (1) {
-            loop();
-        }
-    } else {
-        LOG_MSG("Couldn't initialise cellular.\n");
+    // Run the loop forever
+    upTimer.start();
+    while (1) {
+        loop();
     }
 }
 
