@@ -712,12 +712,12 @@ static bool handleInterrupt()
     
     if (accelerometerConnected) {
         AccelerometerAdxl345::EventsBitmap_t eventsBitmap;
-        // Disable interrupts
-        CriticalSectionLock lock;
+        
+        // TODO: do interrupts need to be disabled while doing this?
+        // I tried using CriticalSectionLock but I2C operations didn't
+        // work correctly afterwards.
         accelerometer.read(&r.accelerometerReading.x, &r.accelerometerReading.y, &r.accelerometerReading.z);
         eventsBitmap = accelerometer.handleInterrupt();
-        // Re-enable interrupts
-        CriticalSectionLock unlock;
         
         // Flag if we're in motion
         if (eventsBitmap & AccelerometerAdxl345::EVENT_ACTIVITY) {
@@ -1515,7 +1515,7 @@ static bool cellularGetTime(time_t *pTime)
     LOG_MSG("Powering up cellular to get time...\n");
     cellular.init();
     cellular.set_credentials(APN, USERNAME, PASSWORD);
-    printf("Connecting to the packet network ...\n");
+    printf("Connecting to the packet network...\n");
     for (x = 0; (cellular.connect() != 0) && (x < CONNECT_RETRIES); x++) {
         printf("Retrying (have you checked that an antenna is plugged in and your APN is correct?)...\n");
         wait_ms(1000);
