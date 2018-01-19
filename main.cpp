@@ -71,27 +71,20 @@
  * The chosen message formats are highly compressed to
  * save data and are of the following form:
  *
- * "gnss:353816058851462;51.283645;-0.776569;1465283731;1;5.15"
+ * "gnss:353816058851462;1465283731;51.283645;-0.776569;1;5.15"
  *
  * ...where the first item is the 15-digit IMEI of the device, the
- * second one the latitude in degrees as a float, the third one the
- * longitude in degrees as a float, then there's the timestamp
- * in Unix time (UTC) and finally the last two, inserted at the end
- * to preserve backwards-compatibility with previous implementations of this
- * messaging system; these are a 1 if the reading was triggered due to the
- * accelerometer indicating motion (0 otherwise) and then the horizontal
- * dilution of position (i.e. accuracy) as a float.  All fields up to and
- * including the timestamp must be present; if either of the fields after the
- * timestamp need to be included then both must be included. This message is
- * queued at every wakeup, if a fix is achieved.
+ * second one the Unix timestamp, the third one the latitude in degrees as a float,
+ * the fourth one the longitude in degrees as a float the fifth a 1 if the
+ * reading was triggered due to the accelerometer indicating motion (0 otherwise)
+ * and finally the horizontal dilution of position (i.e. accuracy)
+ * as a float.  This message is queued at every wakeup, if a fix is achieved.
  * 
- * "telemetry:353816058851462;80.65;-70;1465283731;1"
+ * "telemetry:353816058851462;1465283731;80.65%;-70;1"
  *
- * ...where the first item is the 15-digit IMEI, the second one
- * the battery left as a percentage, the third the signal strength
- * in dBm and then the timestamp in Unix time (UTC).  After the timestamp,
- * for backwards compatibility with earlier versions of this protocol,
- * is the SW version. All fields except the SW version must be present.
+ * ...where the first item is the 15-digit IMEI, the second one the Unix
+ * timestamp, the third the battery left as a percentage, the fourth
+ * the signal strength in dBm the fifth the SW version.
  * This is sent periodically when the device wakes up from deep sleep and
  * every TELEMETRY_PERIOD_SECONDS seconds thereafter.
  *
@@ -1974,10 +1967,18 @@ static void queueTelemetryReport()
     // Add the device ID
     contentsIndex += snprintf(pRecord + contentsIndex, LEN_RECORD_CONTENTS - contentsIndex - 1, "%.*s", IMEI_LENGTH, r.imei);  // -1 for terminator
 
+    // Add Unix time
+    if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD_CONTENTS)) {
+        contentsIndex += snprintf(pRecord + contentsIndex, LEN_RECORD_CONTENTS - contentsIndex - 1, ";%u", (unsigned int) time(NULL));  // -1 for terminator
+        LOG_MSG("Time now is UTC %s.\n", timeString(t));
+    } else {
+        LOG_MSG("WARNING: couldn't fit timestamp into report.\n");
+    }
+
     // Add battery status
     batteryGauge.getRemainingPercentage(&batteryPercent);
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD_CONTENTS)) {
-        contentsIndex += snprintf(pRecord + contentsIndex, LEN_RECORD_CONTENTS - contentsIndex - 1, ";%d", (int) batteryPercent);  // -1 for terminator
+        contentsIndex += snprintf(pRecord + contentsIndex, LEN_RECORD_CONTENTS - contentsIndex - 1, ";%d%%", (int) batteryPercent);  // -1 for terminator
         LOG_MSG("Battery level is %d.\n", (int) batteryPercent);
     } else {
         LOG_MSG("WARNING: couldn't fit battery level into report.\n");
@@ -1991,15 +1992,7 @@ static void queueTelemetryReport()
     } else {
         LOG_MSG("WARNING: couldn't fit Signal Strength reading into report.\n");
     }
-    
-    // Add Unix time
-    if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD_CONTENTS)) {
-        contentsIndex += snprintf(pRecord + contentsIndex, LEN_RECORD_CONTENTS - contentsIndex - 1, ";%u", (unsigned int) time(NULL));  // -1 for terminator
-        LOG_MSG("Time now is UTC %s.\n", timeString(t));
-    } else {
-        LOG_MSG("WARNING: couldn't fit timestamp into report.\n");
-    }
-    
+
     // Add software version
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD_CONTENTS)) {
         contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD_CONTENTS - contentsIndex - 1, ";%u", SW_VERSION);  // -1 for terminator
@@ -2027,13 +2020,6 @@ static void queueGnssReport(float latitude, float longitude, bool motion, float 
     // Add the device ID
     contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD_CONTENTS - contentsIndex - 1, "%.*s", IMEI_LENGTH, r.imei);  // -1 for terminator
 
-    // Add GNSS
-    if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD_CONTENTS)) {
-        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD_CONTENTS - contentsIndex - 1, ";%.6f;%.6f", latitude, longitude);  // -1 for terminator
-    } else {
-        LOG_MSG("WARNING: couldn't fit GNSS reading into report.\n");
-    }
-        
     // Add Unix time
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD_CONTENTS)) {
         contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD_CONTENTS - contentsIndex - 1, ";%u", (unsigned int) time(NULL));  // -1 for terminator
@@ -2041,14 +2027,21 @@ static void queueGnssReport(float latitude, float longitude, bool motion, float 
     } else {
         LOG_MSG("WARNING: couldn't fit timestamp into report.\n");
     }
-    
+
+    // Add GNSS
+    if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD_CONTENTS)) {
+        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD_CONTENTS - contentsIndex - 1, ";%.6f;%.6f", latitude, longitude);  // -1 for terminator
+    } else {
+        LOG_MSG("WARNING: couldn't fit GNSS reading into report.\n");
+    }
+
     // Add motion to the end, to preserve backwards-compatibility
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD_CONTENTS)) {
         contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD_CONTENTS - contentsIndex - 1, ";%d", motion);  // -1 for terminator
     } else {
         LOG_MSG("WARNING: couldn't fit motion indication into report.\n");
     }
-        
+
     // Add HDOP to the end, to preserve backwards-compatibility
     if (hdop != GNSS_INVALID_HDOP) {
         if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD_CONTENTS)) {
@@ -2081,6 +2074,14 @@ static void queueStatsReport()
 
     // Add the device ID
     contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD_CONTENTS - contentsIndex - 1, "%.*s", IMEI_LENGTH, r.imei);  // -1 for terminator
+
+    // Add Unix time
+    if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD_CONTENTS)) {
+        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD_CONTENTS - contentsIndex - 1, ";%u", (unsigned int) time(NULL));  // -1 for terminator
+        LOG_MSG("Time now is UTC %s.\n", timeString(t));
+    } else {
+        LOG_MSG("WARNING: couldn't fit timestamp into report.\n");
+    }
 
     // Add fatal count and types
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD_CONTENTS)) {
@@ -2151,14 +2152,6 @@ static void queueStatsReport()
                                    r.accelerometerReading.x, r.accelerometerReading.y, r.accelerometerReading.z); // -1 for terminator
     } else {
         LOG_MSG("WARNING: couldn't fit last accelerometer reading into report.\n");
-    }
-    
-    // Add Unix time
-    if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD_CONTENTS)) {
-        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD_CONTENTS - contentsIndex - 1, ";%u", (unsigned int) time(NULL));  // -1 for terminator
-        LOG_MSG("Time now is UTC %s.\n", timeString(t));
-    } else {
-        LOG_MSG("WARNING: couldn't fit timestamp into report.\n");
     }
     
     LOG_MSG("%d byte(s) of record used (%d byte(s) unused).\n", (int) (contentsIndex + 1), (int) (LEN_RECORD_CONTENTS - (contentsIndex + 1))); // +1 to account for terminator
@@ -2690,7 +2683,7 @@ static void loop()
             if (wakeOnAccelerometer) {
                 accelerometer.enableInterrupts();
                 setLogFlag(LOG_FLAG_WAKE_ON_INTERRUPT);
-           } else {
+            } else {
                 accelerometer.disableInterrupts();
                 clearLogFlag(LOG_FLAG_WAKE_ON_INTERRUPT);
             }
@@ -2702,6 +2695,11 @@ static void loop()
             // without having to re-register
             clearLogFlag(LOG_FLAG_DEEP_SLEEP_NOT_CLOCK_STOP);
             upTimer.stop();
+            if (accelerometerConnected) {
+                // Make sure that, at the very last minute, the interrupt
+                // is definitely cleared so that it can go off again
+                accelerometer.handleInterrupt();
+            }
             lowPower.enterStandby(r.sleepForSeconds * 1000);
         } else {
             // Otherwise we can go to deep sleep and will re-register when we awake
@@ -2712,10 +2710,20 @@ static void loop()
             if (r.sleepForSeconds > MINIMUM_DEEP_SLEEP_PERIOD_SECONDS) {
                 setLogFlag(LOG_FLAG_DEEP_SLEEP_NOT_CLOCK_STOP);
                 upTimer.stop();
+                if (accelerometerConnected) {
+                    // Make sure that, at the very last minute, the interrupt
+                    // is definitely cleared so that it can go off again
+                    accelerometer.handleInterrupt();
+                }
                 lowPower.enterStop(r.sleepForSeconds * 1000);
             } else {
                 clearLogFlag(LOG_FLAG_DEEP_SLEEP_NOT_CLOCK_STOP);
                 upTimer.stop();
+                if (accelerometerConnected) {
+                    // Make sure that, at the very last minute, the interrupt
+                    // is definitely cleared so that it can go off again
+                    accelerometer.handleInterrupt();
+                }
                 lowPower.enterStandby(r.sleepForSeconds * 1000);
             }
         }
