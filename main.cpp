@@ -14,12 +14,18 @@
  */
 
 /* This is an Mbed port of the code from the https://github.com/u-blox/tracker
- * which ran on a Particle Electron platform.  This code is targetted
+ * which ran on a Particle Electron platform.  This code is targeted
  * at the u-blox C030 board, which uses an STM32F4 processor, a member 
  * of the same processor family as that of the Particle board (so it
- * supports the same power saving behaviours and 4 kBytes of back-up SRAM).
+ * supports the same power saving behaviours and 4 kbytes of back-up SRAM).
  * Since this is a port from Particle it still adopts the setup()/loop()
  * pattern (see towards the end of this file).
+ *
+ * NOTE on HW: for this code to work correctly the INT1 output from the
+ * ADXL345 accelerometer must be connected to the WKUP pin of the STM32F4
+ * CPU on the C030 board.  The WKUP pin is not brought out on the current
+ * C030 boards, instead being attached to a pull-up resistor, so some HW
+ * surgery is required.
  *
  * In order to use power most efficiently, sleep is used in
  * combination with timed operation in the following way:
@@ -268,7 +274,7 @@
 #define MODEM_POWER_ON_DELAY_MILLISECONDS 1000
 
 /// The accelerometer activity threshold (in units of 62.5 mg).
-#define ACCELEROMETER_ACTIVITY_THRESHOLD 3
+#define ACCELEROMETER_ACTIVITY_THRESHOLD 20
 
 /// The maximum time to wait for a GNSS fix
 #define GNSS_MAX_ON_TIME_SECONDS (60 * 10)
@@ -516,10 +522,9 @@ static const char *recordTypeString[] = {"null:", "telemetry:", "gnss:", "stats:
 /// Whether we have an accelerometer or not
 static bool accelerometerConnected = false;
 
-/// The interrupt input pin from the accelerometer, has to be
-// this pin as this is the only pin that can wake the processor
-// from Standby mode.
-static InterruptIn accelerometerInterrupt(PA_0);
+/// An interrupt, purely used so that we can fire an
+// interrupt to wake us from stop-mode sleep.
+static InterruptIn accelerometerInt(PA_0);
 
 /// The stats period, stored in RAM so that it can
 // be overridden.
@@ -620,7 +625,10 @@ static Timer upTimer;
  ***************************************************************/
 
 static uint32_t littleEndianUint32(char *pByte);
+static void resetRetained();
+static void resetReallyRetained();
 static bool handleInterrupt();
+static void wakeUpFromStop();
 static void debugInd(DebugInd_t debugInd);
 static void printHex(const char *pBytes, uint32_t lenBytes);
 static void debugPrintRetained();
@@ -634,8 +642,6 @@ static bool configureGnss();
 static bool gotGnssFix(float *pLatitude, float *pLongitude, float *pElevation, float *pHdop);
 static bool gnssGetTime(time_t *pUnixTimeUtc);
 static bool gnssCanPowerSave();
-static void resetRetained();
-static void resetReallyRetained();
 static time_t gnssOn();
 static bool gnssOff();
 static bool gnssIsOn();
@@ -720,6 +726,13 @@ static bool handleInterrupt()
     }
     
     return activityDetected;
+}
+
+/// Empty interrupt function that we can attach to the
+// accelerometer INT1 output in order to wake-up from
+// stop-mode sleep.
+static void wakeUpFromStop()
+{
 }
 
 /****************************************************************
@@ -2395,8 +2408,9 @@ static void loop()
     // This only for info
     r.numLoops++;
     tNow = time(NULL);
-    LOG_MSG("\n-> Starting loop %d at %d (UTC %s) having power saved since %d second(s) ago (UTC %s).\n", (unsigned int) r.numLoops,
-            (int) tNow, timeString(tNow), (int) (tNow - r.powerSaveTime), timeString(r.powerSaveTime));
+    LOG_MSG("\n-> Starting loop %d at %d (UTC %s) having power saved for %d second(s).\n",
+            (unsigned int) r.numLoops,
+            (int) tNow, timeString(tNow), (int) (tNow - r.powerSaveTime));
 
     // If we are in slow operation override the stats timer period
     // so that it is more frequent; it is useful to see these stats in
@@ -2677,10 +2691,10 @@ static void loop()
     // Now go to sleep for the allotted time.
     r.sleepStartSeconds = time(NULL);
     if (r.sleepForSeconds > 0) {
-        // If the accelerometer interrupt goes off it will wake us up and then be
-        // reset when we eventually awake.
         if (accelerometerConnected) {
             if (wakeOnAccelerometer) {
+                // If the accelerometer interrupt goes off it will wake us up and then be
+                // reset when we eventually awake.
                 accelerometer.enableInterrupts();
                 setLogFlag(LOG_FLAG_WAKE_ON_INTERRUPT);
             } else {
@@ -2689,7 +2703,6 @@ static void loop()
             }
         }
         
-        // The sleep calls here will wake up when the accelerometer raises it's interrupt line.
         if (r.modemStaysAwake || (r.sleepForSeconds < MINIMUM_DEEP_SLEEP_PERIOD_SECONDS)) {
             // Sleep with the network connection up so that we can send reports
             // without having to re-register
@@ -2698,13 +2711,12 @@ static void loop()
             if (accelerometerConnected) {
                 // Make sure that, at the very last minute, the interrupt
                 // is definitely cleared so that it can go off again
+                // (see also note on interrupts at the top of this file)
                 accelerometer.handleInterrupt();
             }
-            lowPower.enterStandby(r.sleepForSeconds * 1000);
+            lowPower.enterStop(r.sleepForSeconds * 1000);
         } else {
             // Otherwise we can go to deep sleep and will re-register when we awake
-            // NOTE: we will come back from reset after this, only the
-            // retained variables will be kept
             cellular.disconnect();
             cellular.deinit();
             if (r.sleepForSeconds > MINIMUM_DEEP_SLEEP_PERIOD_SECONDS) {
@@ -2713,18 +2725,22 @@ static void loop()
                 if (accelerometerConnected) {
                     // Make sure that, at the very last minute, the interrupt
                     // is definitely cleared so that it can go off again
+                    // (see also note on interrupts at the top of this file)
                     accelerometer.handleInterrupt();
                 }
-                lowPower.enterStop(r.sleepForSeconds * 1000);
+                // NOTE: we will come back from reset after this, only the
+                // retained variables will be kept
+                lowPower.enterStandby(r.sleepForSeconds * 1000);
             } else {
                 clearLogFlag(LOG_FLAG_DEEP_SLEEP_NOT_CLOCK_STOP);
                 upTimer.stop();
                 if (accelerometerConnected) {
                     // Make sure that, at the very last minute, the interrupt
                     // is definitely cleared so that it can go off again
+                    // (see also note on interrupts at the top of this file)
                     accelerometer.handleInterrupt();
                 }
-                lowPower.enterStandby(r.sleepForSeconds * 1000);
+                lowPower.enterStop(r.sleepForSeconds * 1000);
             }
         }
     }
@@ -2743,6 +2759,9 @@ int main()
     
     // Make sure the external wakeup pin is enabled
     HAL_PWR_EnableWakeUpPin(PWR_WAKEUP_PIN1);
+    
+    // Set the accelerometer interrupt pin to be a rising edge interrupt
+    accelerometerInt.rise(wakeUpFromStop);
     
     // Do all the setup stuff
     setup();
