@@ -13,6 +13,10 @@
  * limitations under the License.
  */
 
+/* NOTE: the comment below is also included in the README.md.  If you
+ * update the comment, please ensure that the README.md is updated also.
+ */
+ 
 /* This is an Mbed port of the code from the https://github.com/u-blox/tracker
  * which ran on a Particle Electron platform.  This code is targeted
  * at the u-blox C030 board, which uses an STM32F4 processor, a member 
